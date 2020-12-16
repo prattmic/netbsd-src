@@ -73,6 +73,7 @@ __KERNEL_RCSID(0, "$NetBSD: kern_event.c,v 1.109 2020/12/11 03:00:09 thorpej Exp
 #include <sys/eventvar.h>
 #include <sys/poll.h>
 #include <sys/kmem.h>
+#include <sys/ktrace.h>
 #include <sys/stat.h>
 #include <sys/filedesc.h>
 #include <sys/syscallargs.h>
@@ -1398,6 +1399,7 @@ kqueue_scan(file_t *fp, size_t maxevents, struct kevent *ulistp,
 	size_t		count, nkev, nevents;
 	int		timeout, error, touch, rv;
 	filedesc_t	*fdp;
+	char val = 1;
 
 	fdp = curlwp->l_fd;
 	kq = fp->f_kqueue;
@@ -1422,11 +1424,15 @@ kqueue_scan(file_t *fp, size_t maxevents, struct kevent *ulistp,
 		timeout = 0;
 	}
 
+	ktrkuser("kq_scan_timeout", &timeout, sizeof(timeout));
+
 	memset(&morker, 0, sizeof(morker));
 	marker = &morker;
 	marker->kn_status = KN_MARKER;
 	mutex_spin_enter(&kq->kq_lock);
  retry:
+	ktrkuser("kq_scan_lock", &val, sizeof(val));
+	ktrkuser("kq_scan_count", &kq->kq_count, sizeof(kq->kq_count));
 	kevp = kevbuf;
 	if (kq->kq_count == 0) {
 		if (timeout >= 0) {
@@ -1444,6 +1450,8 @@ kqueue_scan(file_t *fp, size_t maxevents, struct kevent *ulistp,
 					error = 0;
 			}
 		}
+		val = 1;
+		ktrkuser("kq_scan_unlock", &val, sizeof(val));
 		mutex_spin_exit(&kq->kq_lock);
 	} else {
 		/* mark end of knote list */
@@ -1453,9 +1461,13 @@ kqueue_scan(file_t *fp, size_t maxevents, struct kevent *ulistp,
 		 * Acquire the fdp->fd_lock interlock to avoid races with
 		 * file creation/destruction from other threads.
 		 */
+		val = 2;
+		ktrkuser("kq_scan_unlock", &val, sizeof(val));
 		mutex_spin_exit(&kq->kq_lock);
 		mutex_enter(&fdp->fd_lock);
 		mutex_spin_enter(&kq->kq_lock);
+		val = 2;
+		ktrkuser("kq_scan_lock", &val, sizeof(val));
 
 		while (count != 0) {
 			kn = TAILQ_FIRST(&kq->kq_head);	/* get next knote */
@@ -1485,6 +1497,8 @@ kqueue_scan(file_t *fp, size_t maxevents, struct kevent *ulistp,
 				continue;
 			}
 			if ((kn->kn_flags & EV_ONESHOT) == 0) {
+				val = 3;
+				ktrkuser("kq_scan_unlock", &val, sizeof(val));
 				mutex_spin_exit(&kq->kq_lock);
 				KASSERT(kn->kn_fop != NULL);
 				KASSERT(kn->kn_fop->f_event != NULL);
@@ -1493,6 +1507,8 @@ kqueue_scan(file_t *fp, size_t maxevents, struct kevent *ulistp,
 				rv = (*kn->kn_fop->f_event)(kn, 0);
 				KERNEL_UNLOCK_ONE(NULL);	/* XXXSMP */
 				mutex_spin_enter(&kq->kq_lock);
+				val = 3;
+				ktrkuser("kq_scan_lock", &val, sizeof(val));
 				/* Re-poll if note was re-enqueued. */
 				if ((kn->kn_status & KN_QUEUED) != 0) {
 					kn->kn_status &= ~KN_BUSY;
@@ -1512,11 +1528,15 @@ kqueue_scan(file_t *fp, size_t maxevents, struct kevent *ulistp,
 					kn->kn_fop->f_touch != NULL);
 			/* XXXAD should be got from f_event if !oneshot. */
 			if (touch) {
+				val = 4;
+				ktrkuser("kq_scan_unlock", &val, sizeof(val));
 				mutex_spin_exit(&kq->kq_lock);
 				KERNEL_LOCK(1, NULL);		/* XXXSMP */
 				(*kn->kn_fop->f_touch)(kn, kevp, EVENT_PROCESS);
 				KERNEL_UNLOCK_ONE(NULL);	/* XXXSMP */
 				mutex_spin_enter(&kq->kq_lock);
+				val = 4;
+				ktrkuser("kq_scan_lock", &val, sizeof(val));
 			} else {
 				*kevp = kn->kn_kevent;
 			}
@@ -1525,10 +1545,14 @@ kqueue_scan(file_t *fp, size_t maxevents, struct kevent *ulistp,
 			if (kn->kn_flags & EV_ONESHOT) {
 				/* delete ONESHOT events after retrieval */
 				kn->kn_status &= ~KN_BUSY;
+                                val = 5;
+                                ktrkuser("kq_scan_unlock", &val, sizeof(val));
 				mutex_spin_exit(&kq->kq_lock);
 				knote_detach(kn, fdp, true);
 				mutex_enter(&fdp->fd_lock);
 				mutex_spin_enter(&kq->kq_lock);
+                                val = 5;
+                                ktrkuser("kq_scan_lock", &val, sizeof(val));
 			} else if (kn->kn_flags & EV_CLEAR) {
 				/* clear state after retrieval */
 				kn->kn_data = 0;
@@ -1556,6 +1580,8 @@ kqueue_scan(file_t *fp, size_t maxevents, struct kevent *ulistp,
 			}
 			if (nkev == kevcnt) {
 				/* do copyouts in kevcnt chunks */
+				val = 6;
+				ktrkuser("kq_scan_unlock", &val, sizeof(val));
 				mutex_spin_exit(&kq->kq_lock);
 				mutex_exit(&fdp->fd_lock);
 				error = (*keops->keo_put_events)
@@ -1563,6 +1589,8 @@ kqueue_scan(file_t *fp, size_t maxevents, struct kevent *ulistp,
 				    kevbuf, ulistp, nevents, nkev);
 				mutex_enter(&fdp->fd_lock);
 				mutex_spin_enter(&kq->kq_lock);
+				val = 6;
+				ktrkuser("kq_scan_lock", &val, sizeof(val));
 				nevents += nkev;
 				nkev = 0;
 				kevp = kevbuf;
@@ -1575,6 +1603,8 @@ kqueue_scan(file_t *fp, size_t maxevents, struct kevent *ulistp,
 			}
 		}
  done:
+		val = 7;
+		ktrkuser("kq_scan_unlock", &val, sizeof(val));
 		mutex_spin_exit(&kq->kq_lock);
 		mutex_exit(&fdp->fd_lock);
 	}
@@ -1584,6 +1614,8 @@ kqueue_scan(file_t *fp, size_t maxevents, struct kevent *ulistp,
 		    kevbuf, ulistp, nevents, nkev);
 	}
 	*retval = maxevents - count;
+
+	ktrkuser("kq_scan_retval", retval, sizeof(*retval));
 
 	return error;
 }
